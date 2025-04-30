@@ -1166,7 +1166,7 @@ execute(proverInput) {
     // 1. Validate input
     this._validateProverInput(sanitizedInput);
     
-    // Rest of the method...
+   
     
     // 2. Initialize VOLE
     this.verifierDelta = this.vole.initialize();
