@@ -22,6 +22,20 @@ const LogRobinPP = (() => {
      * @param {number|BigInt} modulus - Prime modulus for the field
      */
 
+    // Add this method to FiniteField class
+validateFieldElement(value) {
+  if (typeof value !== 'bigint') {
+    try {
+      value = BigInt(value);
+    } catch (e) {
+      throw new Error(`Invalid field element: ${value}`);
+    }
+  }
+  
+  // Ensure value is in range [0, modulus-1]
+  return ((value % this.modulus) + this.modulus) % this.modulus;
+}
+
     static serializeBigInt(obj) {
       return JSON.stringify(obj, (key, value) => 
         typeof value === 'bigint' ? value.toString() : value
@@ -262,55 +276,77 @@ const LogRobinPP = (() => {
    * @class Circuit
    * @description Represents a circuit in the protocol
    */
-  class Circuit {
-    /**
-     * @constructor
-     * @param {Object} params - Circuit parameters
-     */
-    constructor({ id, ninputs, nmuls, field, satisfactionCondition }) {
-      this.id = id;
-      this.ninputs = ninputs;
-      this.nmuls = nmuls;
-      this.field = field;
-      this.satisfactionCondition = satisfactionCondition;
+ // Fixed Circuit class with both logger and multiplication gate fixes
+class Circuit {
+  constructor({ id, ninputs, nmuls, field, satisfactionCondition, logger }) {
+    this.id = id;
+    this.ninputs = ninputs;
+    this.nmuls = nmuls;
+    this.field = field;
+    this.satisfactionCondition = satisfactionCondition;
+    this.logger = logger || { 
+      debug: () => {}, 
+      error: console.error 
+    }; // Provide a default logger if none is passed
+  }
+
+  // Fixed evaluate method with safe input access for multiplication gates
+  evaluate({ inputs }) {
+    if (inputs.length !== this.ninputs) {
+      throw new Error(
+        `Circuit expects ${this.ninputs} inputs, got ${inputs.length}`
+      );
     }
 
-    /**
-     * @method evaluate
-     * @description Evaluate the circuit with inputs
-     */
-    evaluate({ inputs }) {
-      if (inputs.length !== this.ninputs) {
-        throw new Error(
-          `Circuit expects ${this.ninputs} inputs, got ${inputs.length}`,
-        );
-      }
-
+    try {
       // Default satisfaction condition: sum equals circuit id modulo field
       const defaultCondition = (inputs) => {
+        if (!Array.isArray(inputs) || inputs.some(x => typeof x !== 'bigint')) {
+          throw new Error('Invalid inputs format: expected array of BigInts');
+        }
+        
         const sum = inputs.reduce((a, b) => this.field.add(a, b), 0n);
-
-        console.log("Sum:", sum.toString());
-        console.log("Expected:", BigInt(this.id % Number(this.field.modulus)).toString());
-        console.log("Field modulus:", this.field.modulus.toString());
-        return sum % this.field.modulus === BigInt(this.id % Number(this.field.modulus));
+        const expected = BigInt(this.id % Number(this.field.modulus));
+        
+        if (this.logger && this.logger.debug) {
+          this.logger.debug(`Input sum: ${sum.toString()}`);
+          this.logger.debug(`Expected: ${expected.toString()}`);
+        }
+        
+        return this.field.subtract(sum, expected) === 0n;
       };
 
       const condition = this.satisfactionCondition || defaultCondition;
 
-      // Generate multiplication gates and their outputs
+      // Generate multiplication gates and their outputs with validation
       const leftInputs = [];
       const rightInputs = [];
       const mulOutputs = [];
 
+      // FIXED MULTIPLICATION GATE ACCESS PATTERN:
+      // Ensure we can always access inputs for multiplication gates
+      // even when nmuls > ninputs by using modulo operations
       for (let i = 0; i < this.nmuls; i++) {
-        const left = inputs[i % inputs.length];
-        const right = inputs[(i + 1) % inputs.length];
+        // Safely get left and right inputs using modulo to wrap around
+        const leftIdx = i % this.ninputs;
+        const rightIdx = (i + 1) % this.ninputs;
+        
+        const left = inputs[leftIdx];
+        const right = inputs[rightIdx];
+        
+        if (typeof left !== 'bigint' || typeof right !== 'bigint') {
+          throw new Error(`Invalid input types for multiplication gate ${i}`);
+        }
+        
         const output = this.field.multiply(left, right);
 
         leftInputs.push(left);
         rightInputs.push(right);
         mulOutputs.push(output);
+        
+        if (this.logger && this.logger.debug) {
+          this.logger.debug(`Gate ${i}: ${left} × ${right} = ${output}`);
+        }
       }
 
       // Check if inputs satisfy the circuit
@@ -324,8 +360,17 @@ const LogRobinPP = (() => {
         result,
         satisfied,
       };
+    } catch (error) {
+      // Safely use logger if it exists, otherwise just console.error
+      if (this.logger && this.logger.error) {
+        this.logger.error(`Circuit evaluation error: ${error.message}`);
+      } else {
+        console.error(`Circuit evaluation error: ${error.message}`);
+      }
+      throw error;
     }
   }
+}
 
   //============================================================================
   // EVAL-IT-MAC (CIRCUIT EVALUATION OVER IT-MACS)
@@ -350,77 +395,82 @@ const LogRobinPP = (() => {
      * @method evaluate
      * @description Evaluate circuit over IT-MAC commitments
      */
-    evaluate({ inputCommitments, outputCommitments }) {
-      this.logger.debug(`Evaluating circuit ${this.circuit.id} over IT-MACs`);
- // Get ACTUAL witness values from commitments
+// Fix for the evaluate method in EvalITMAC class
+evaluate({ inputCommitments, outputCommitments }) {
+  this.logger.debug(`Evaluating circuit ${this.circuit.id} over IT-MACs`);
+  
+  if (inputCommitments.length !== this.circuit.ninputs) {
+    throw new Error(
+      `Expected ${this.circuit.ninputs} input commitments, got ${inputCommitments.length}`,
+    );
+  }
 
-      if (inputCommitments.length !== this.circuit.ninputs) {
-        throw new Error(
-          `Expected ${this.circuit.ninputs} input commitments, got ${inputCommitments.length}`,
-        );
-      }
+  if (outputCommitments.length !== this.circuit.nmuls) {
+    throw new Error(
+      `Expected ${this.circuit.nmuls} output commitments, got ${outputCommitments.length}`,
+    );
+  }
 
-      if (outputCommitments.length !== this.circuit.nmuls) {
-        throw new Error(
-          `Expected ${this.circuit.nmuls} output commitments, got ${outputCommitments.length}`,
-        );
-      }
+  // For each multiplication gate, we need to track:
+  // 1. Left input IT-MAC
+  // 2. Right input IT-MAC
+  // 3. Output IT-MAC (from the committed outputs)
+  const triples = [];
 
-      // For each multiplication gate, we need to track:
-      // 1. Left input IT-MAC
-      // 2. Right input IT-MAC
-      // 3. Output IT-MAC (from the committed outputs)
-      const triples = [];
+  // Simulate circuit evaluation to get the left/right inputs for each gate
+  const actualInputs = inputCommitments.map(c => c.value);
+  
+  // Ensure the circuit has access to the logger
+  if (!this.circuit.logger && this.logger) {
+    this.circuit.logger = this.logger;
+  }
 
-      // Simulate circuit evaluation to get the left/right inputs for each gate
-      const actualInputs = inputCommitments.map(c => c.value);
+  const circuitEval = this.circuit.evaluate({ 
+    inputs: actualInputs // Use real witness values
+  });
 
-      const circuitEval = this.circuit.evaluate({ 
-        inputs: actualInputs // Use real witness values
-      });
+  // For each multiplication gate, create a triple
+  for (let i = 0; i < this.circuit.nmuls; i++) {
+    // In a real circuit, we would use the actual wire values
+    // Here we're simply using the input commitments based on indices
+    const leftInputIdx = i % this.circuit.ninputs;
+    const rightInputIdx = (i + 1) % this.circuit.ninputs;
 
-      // For each multiplication gate, create a triple
-      for (let i = 0; i < this.circuit.nmuls; i++) {
-        // In a real circuit, we would use the actual wire values
-        // Here we're simply using the input commitments based on indices
-        const leftInputIdx = i % this.circuit.ninputs;
-        const rightInputIdx = (i + 1) % this.circuit.ninputs;
+    const leftInput = inputCommitments[leftInputIdx];
+    const rightInput = inputCommitments[rightInputIdx];
+    const output = outputCommitments[i];
 
-        const leftInput = inputCommitments[leftInputIdx];
-        const rightInput = inputCommitments[rightInputIdx];
-        const output = outputCommitments[i];
+    triples.push({
+      left: leftInput,
+      right: rightInput,
+      output: output,
+    });
+  }
 
-        triples.push({
-          left: leftInput,
-          right: rightInput,
-          output: output,
-        });
-      }
+  // Add a final "triple" for the circuit output
+  // In a real implementation, we would compute this properly
+  // Here we're adding a dummy output that should be 0 for the active branch
+  const outputCommitment = new ITMACCommitment({
+    value: 0n,
+    mac: 0n,
+    field: this.field,
+  });
 
-      // Add a final "triple" for the circuit output
-      // In a real implementation, we would compute this properly
-      // Here we're adding a dummy output that should be 0 for the active branch
-      const outputCommitment = new ITMACCommitment({
-        value: 0n,
-        mac: 0n,
-        field: this.field,
-      });
+  triples.push({
+    left: outputCommitment,
+    right: outputCommitment,
+    output: new ITMACCommitment({
+      value: 0n,
+      mac: 0n,
+      field: this.field,
+    }),
+  });
 
-      triples.push({
-        left: outputCommitment,
-        right: outputCommitment,
-        output: new ITMACCommitment({
-          value: 0n,
-          mac: 0n,
-          field: this.field,
-        }),
-      });
-
-      this.logger.debug(
-        `Generated ${triples.length} triples for circuit ${this.circuit.id}`,
-      );
-      return triples;
-    }
+  this.logger.debug(
+    `Generated ${triples.length} triples for circuit ${this.circuit.id}`,
+  );
+  return triples;
+}
   }
 
   //============================================================================
@@ -595,41 +645,59 @@ const LogRobinPP = (() => {
      * @method decomposeId
      * @description Decompose id into bits
      */
-    decomposeId(id) {
-      const bits = [];
-      for (let i = 0; i < this.b; i++) {
-        bits.push((id >> i) & 1);
-      }
-      return bits;
-    }
+    // Fix for decomposeId method in ZeroMembershipProver class
+decomposeId(id) {
+  // Handle when B is not a power of 2
+  const bits = [];
+  for (let i = 0; i < this.b; i++) {
+    bits.push((id >> i) & 1);
+  }
+  
+  // Add validation to ensure we're not exceeding bounds
+  if (id >= this.B) {
+    throw new Error(`ID ${id} is out of bounds for branch count ${this.B}`);
+  }
+  
+  return bits;
+}
 
     /**
      * @method constructPathMatrix
      * @description Construct the path matrix based on id bits and Lambda
      */
+    // In ZeroMembershipProver class
     constructPathMatrix({ idBits, Lambda, deltaValues }) {
-      const matrix = Array(2)
-        .fill()
-        .map(() => Array(this.b).fill(0n));
-
+      // Input validation
+      if (!Array.isArray(idBits) || idBits.length !== this.b) {
+        throw new Error(`Invalid idBits: expected ${this.b} bits`);
+      }
+      
+      if (!Array.isArray(deltaValues) || deltaValues.length !== this.b) {
+        throw new Error(`Invalid deltaValues: expected ${this.b} values`);
+      }
+      
+      // Ensure Lambda is properly in the field
+      Lambda = this.field.validateFieldElement(Lambda);
+      
+      // Ensure matrix is constructed exactly per paper's Equation
+      const matrix = Array(2).fill().map(() => Array(this.b).fill(0n));
+      
       for (let i = 0; i < this.b; i++) {
+        if (idBits[i] !== 0 && idBits[i] !== 1) {
+          throw new Error(`Invalid bit at position ${i}: ${idBits[i]}`);
+        }
+        
+        const deltaValue = this.field.validateFieldElement(deltaValues[i]);
+        
         if (idBits[i] === 0) {
-          // If bit is 0, the Lambda term is in the top row
-          matrix[0][i] = this.field.add(
-            this.field.multiply(Lambda, 1n),
-            deltaValues[i],
-          );
-          matrix[1][i] = this.field.subtract(0n, deltaValues[i]);
+          matrix[0][i] = this.field.add(this.field.multiply(Lambda, 1n), deltaValue);
+          matrix[1][i] = this.field.subtract(0n, deltaValue);
         } else {
-          // If bit is 1, the Lambda term is in the bottom row
-          matrix[0][i] = this.field.add(0n, deltaValues[i]);
-          matrix[1][i] = this.field.subtract(
-            this.field.multiply(Lambda, 1n),
-            deltaValues[i],
-          );
+          matrix[0][i] = this.field.add(0n, deltaValue);
+          matrix[1][i] = this.field.subtract(this.field.multiply(Lambda, 1n), deltaValue);
         }
       }
-
+      
       return matrix;
     }
 
@@ -637,27 +705,37 @@ const LogRobinPP = (() => {
      * @method computeBranchCoefficients
      * @description Compute path coefficient for each branch
      */
-    computeBranchCoefficients({ pathMatrix }) {
-      const coefficients = Array(this.B).fill(1n);
 
-      for (let a = 0; a < this.B; a++) {
-        // Decompose branch index into bits
-        const aBits = [];
-        for (let i = 0; i < this.b; i++) {
-          aBits.push((a >> i) & 1);
-        }
+computeBranchCoefficients({ pathMatrix }) {
+  if (!pathMatrix || pathMatrix.length !== 2 || pathMatrix[0].length !== this.b) {
+    throw new Error(`Invalid path matrix dimensions. Expected 2×${this.b}`);
+  }
 
-        // Multiply path matrix elements based on branch bits
-        for (let i = 0; i < this.b; i++) {
-          coefficients[a] = this.field.multiply(
-            coefficients[a],
-            pathMatrix[aBits[i]][i],
-          );
-        }
-      }
+  const coefficients = Array(this.B).fill(1n);
 
-      return coefficients;
+  for (let a = 0; a < this.B; a++) {
+    // Decompose branch index into bits correctly
+    const aBits = [];
+    for (let i = 0; i < this.b; i++) {
+      aBits.push((a >> i) & 1);
     }
+
+    // Multiply path matrix elements based on branch bits
+    // with careful field operations
+    for (let i = 0; i < this.b; i++) {
+      if (aBits[i] >= 0 && aBits[i] < 2 && i < pathMatrix[0].length) {
+        coefficients[a] = this.field.multiply(
+          coefficients[a],
+          pathMatrix[aBits[i]][i]
+        );
+      } else {
+        throw new Error(`Invalid bit value or index in branch coefficient computation`);
+      }
+    }
+  }
+
+  return coefficients;
+}
 
     /**
      * @method preparePolynomialCoefficients
@@ -665,13 +743,31 @@ const LogRobinPP = (() => {
      */
 // Fixed preparePolynomialCoefficients method
 // In ZeroMembershipProver class
+// Fixed ZeroMembershipProver.preparePolynomialCoefficients method
 preparePolynomialCoefficients({ values, branchCoefficients, id }) {
+  // Input validation
+  if (!Array.isArray(values) || values.length !== this.B) {
+    throw new Error(`Invalid values array: expected length ${this.B}`);
+  }
+  
+  if (!Array.isArray(branchCoefficients) || branchCoefficients.length !== this.B) {
+    throw new Error(`Invalid branch coefficients array: expected length ${this.B}`);
+  }
+  
+  if (id < 0 || id >= this.B) {
+    throw new Error(`Invalid id ${id}, must be in range [0,${this.B-1}]`);
+  }
+  
   const coefficients = Array(this.b).fill(0n);
   
   for (let a = 0; a < this.B; a++) {
     if (a === id) continue;
     
-    const term = this.field.multiply(values[a], branchCoefficients[a]);
+    // Get field elements to ensure consistent field operations
+    const value = this.field.validateFieldElement(values[a]);
+    const branchCoeff = this.field.validateFieldElement(branchCoefficients[a]);
+    
+    const term = this.field.multiply(value, branchCoeff);
     
     // Find first set bit in branch index
     const bits = [];
@@ -778,11 +874,12 @@ preparePolynomialCoefficients({ values, branchCoefficients, id }) {
      * @constructor
      * @param {Object} params - Parameters
      */
-    constructor({ field, logger, B }) {
-      this.field = field;
-      this.logger = logger;
-      this.B = B;
-    }
+    
+      constructor({ field, logger, B }) {
+        this.field = field;
+        this.logger = logger || { debug: () => {}, error: console.error };
+        this.B = B;
+      }
 
     /**
      * @method generateCoefficients
@@ -842,56 +939,54 @@ preparePolynomialCoefficients({ values, branchCoefficients, id }) {
      */
 
     // Fixed combineValues method in AffineCorrelationProver class
+// In AffineCorrelationProver class
 combineValues({ M2, M1, M0, chi, r1, r2, mr1, mr2 }) {
-  // Validation
-  if (!Array.isArray(M2) || M2.length !== this.B) {
-    throw new Error(`Invalid M2 array: expected length ${this.B}`);
-  }
-
-  // Calculate combinedM2 - use r2 directly
-  let combinedM2 = r2;
-  this.logger.debug(`combinedM2 starting with r2=${r2}`);
+  // Initialize with properly validated masking values
+  let combinedM2 = this.field.validateFieldElement(r2);
+  let combinedM1 = this.field.add(
+    this.field.validateFieldElement(r1), 
+    this.field.validateFieldElement(mr2)
+  );
+  let combinedM0 = this.field.validateFieldElement(mr1);
   
+  // Log starting values for debugging
+  if (this.logger && this.logger.debug) {
+    this.logger.debug(`Starting values: combinedM2=${combinedM2}, combinedM1=${combinedM1}, combinedM0=${combinedM0}`);
+  }
+  
+  // Add contributions from each branch with careful field operations
   for (let i = 0; i < this.B; i++) {
-    // Get field elements to ensure consistent field operations
-    const m2Val = this.field.add(M2[i], 0n);
-    const chiVal = this.field.add(chi[i], 0n);
+    // Validate all inputs as field elements
+    const m2 = this.field.validateFieldElement(M2[i]);
+    const m1 = this.field.validateFieldElement(M1[i]);
+    const m0 = this.field.validateFieldElement(M0[i]);
+    const chiVal = this.field.validateFieldElement(chi[i]);
     
-    const termM2 = this.field.multiply(chiVal, m2Val);
-    combinedM2 = this.field.add(combinedM2, termM2);
-    this.logger.debug(`combinedM2 step ${i}: added ${chiVal} * ${m2Val} = ${termM2}, now ${combinedM2}`);
+    // Calculate contribution with field operations
+    const m2Contrib = this.field.multiply(chiVal, m2);
+    const m1Contrib = this.field.multiply(chiVal, m1);
+    const m0Contrib = this.field.multiply(chiVal, m0);
+    
+    // Add contributions to combined values
+    combinedM2 = this.field.add(combinedM2, m2Contrib);
+    combinedM1 = this.field.add(combinedM1, m1Contrib);
+    combinedM0 = this.field.add(combinedM0, m0Contrib);
+    
+    // Log each step for debugging
+    if (this.logger && this.logger.debug) {
+      this.logger.debug(`Branch ${i}: chi=${chiVal}, M2=${m2}, M1=${m1}, M0=${m0}`);
+      this.logger.debug(`- Contributions: M2=${m2Contrib}, M1=${m1Contrib}, M0=${m0Contrib}`);
+      this.logger.debug(`- After branch ${i}: combinedM2=${combinedM2}, combinedM1=${combinedM1}, combinedM0=${combinedM0}`);
+    }
   }
   
-  // Calculate combinedM1 - use r1 + mr2
-  let combinedM1 = this.field.add(r1, mr2);
-  this.logger.debug(`combinedM1 starting with r1+mr2=${combinedM1}`);
-  
-  for (let i = 0; i < this.B; i++) {
-    const m1Val = this.field.add(M1[i], 0n);
-    const chiVal = this.field.add(chi[i], 0n);
-    
-    const termM1 = this.field.multiply(chiVal, m1Val);
-    combinedM1 = this.field.add(combinedM1, termM1);
-    this.logger.debug(`combinedM1 step ${i}: added ${chiVal} * ${m1Val} = ${termM1}, now ${combinedM1}`);
+  // Log final values
+  if (this.logger && this.logger.debug) {
+    this.logger.debug(`Final combined: M2=${combinedM2}, M1=${combinedM1}, M0=${combinedM0}`);
   }
   
-  // Calculate combinedM0 - use mr1 directly
-  let combinedM0 = mr1;
-  this.logger.debug(`combinedM0 starting with mr1=${mr1}`);
-  
-  for (let i = 0; i < this.B; i++) {
-    const m0Val = this.field.add(M0[i], 0n);
-    const chiVal = this.field.add(chi[i], 0n);
-    
-    const termM0 = this.field.multiply(chiVal, m0Val);
-    combinedM0 = this.field.add(combinedM0, termM0);
-    this.logger.debug(`combinedM0 step ${i}: added ${chiVal} * ${m0Val} = ${termM0}, now ${combinedM0}`);
-  }
-  
-  this.logger.debug(`Final combined values: M2=${combinedM2}, M1=${combinedM1}, M0=${combinedM0}`);
-  return { combinedM1, combinedM0, combinedM2 };
+  return { combinedM2, combinedM1, combinedM0 };
 }
-
 
 
   }
@@ -901,17 +996,13 @@ combineValues({ M2, M1, M0, chi, r1, r2, mr1, mr2 }) {
    * @description Verifier part of affine correlation protocol
    */
   class AffineCorrelationVerifier {
-    /**
-     * @constructor
-     * @param {Object} params - Parameters
-     */
     constructor({ field, logger, B, delta }) {
       this.field = field;
-      this.logger = logger;
+      this.logger = logger || { debug: () => {}, error: console.error };
       this.B = B;
-      this.delta = delta;
+      this.delta = this.field.validateFieldElement(delta);
     }
-
+  
     /**
      * @method generateChi
      * @description Generate random challenges for combining branches
@@ -921,92 +1012,106 @@ combineValues({ M2, M1, M0, chi, r1, r2, mr1, mr2 }) {
         .fill()
         .map(() => this.field.randomElement());
     }
-
-    /**
-     * @method computeK
-     * @description Compute K values for each branch
-     */
-    computeK({ M2, M1, M0 }) {
-      const K = Array(this.B).fill(0n);
-
-      for (let i = 0; i < this.B; i++) {
-        const delta2 = this.field.multiply(this.delta, this.delta);
-
-        K[i] = this.field.add(
-          this.field.add(
-            this.field.multiply(M2[i], delta2),
-            this.field.multiply(M1[i], this.delta),
-          ),
-          M0[i],
-        );
-      }
-
-      return K;
-    }
-
+  
     /**
      * @method combineK
-     * @description Combine K values based on chi challenges
+     * @description Combine K values based on chi challenges with consistent field operations
      */
     combineK({ K, chi, kr1, kr2 }) {
-      // Start with masking values
-      let combinedK = this.field.add(kr1, kr2);
-      this.logger.debug(`combineK starting with kr1+kr2=${combinedK}`);
+      // Start with properly validated masking values
+      const validKr1 = this.field.validateFieldElement(kr1);
+      const validKr2 = this.field.validateFieldElement(kr2);
+      let combinedK = this.field.add(validKr1, validKr2);
       
-      for (let i = 0; i < this.B; i++) {
-        // Get field elements
-        const kVal = this.field.add(K[i], 0n);
-        const chiVal = this.field.add(chi[i], 0n);
-        
-        const contribution = this.field.multiply(chiVal, kVal);
-        combinedK = this.field.add(combinedK, contribution);
-        this.logger.debug(`combineK step ${i}: added ${chiVal} * ${kVal} = ${contribution}, now ${combinedK}`);
+      // Log start value for debugging
+      if (this.logger && this.logger.debug) {
+        this.logger.debug(`combineK starting with kr1+kr2=${combinedK}`);
       }
       
-      this.logger.debug(`Final combineK: ${combinedK}`);
+      // Add contributions from each branch
+      for (let i = 0; i < this.B; i++) {
+        // Validate inputs as field elements
+        const kVal = this.field.validateFieldElement(K[i]);
+        const chiVal = this.field.validateFieldElement(chi[i]);
+        
+        // Calculate and add contribution
+        const contribution = this.field.multiply(chiVal, kVal);
+        combinedK = this.field.add(combinedK, contribution);
+        
+        // Log each step for debugging
+        if (this.logger && this.logger.debug) {
+          this.logger.debug(`combineK step ${i}: added ${chiVal} * ${kVal} = ${contribution}, now ${combinedK}`);
+        }
+      }
+      
+      // Log final value
+      if (this.logger && this.logger.debug) {
+        this.logger.debug(`Final combineK: ${combinedK}`);
+      }
+      
       return combinedK;
     }
-
+  
+    /**
+     * @method calculateExpected
+     * @description Calculate expected K value from polynomial evaluation
+     */
+    calculateExpected({ combinedM2, combinedM1, combinedM0 }) {
+      // Validate all inputs as field elements
+      const m2 = this.field.validateFieldElement(combinedM2);
+      const m1 = this.field.validateFieldElement(combinedM1);
+      const m0 = this.field.validateFieldElement(combinedM0);
+      
+      // Calculate with careful field operations
+      const delta2 = this.field.multiply(this.delta, this.delta);
+      const term1 = this.field.multiply(m2, delta2);
+      const term2 = this.field.multiply(m1, this.delta);
+      const sum = this.field.add(term1, term2);
+      const expected = this.field.add(sum, m0);
+      
+      // Log calculation details for debugging
+      if (this.logger && this.logger.debug) {
+        this.logger.debug(`Polynomial calculation:`);
+        this.logger.debug(`- Delta=${this.delta}, Delta²=${delta2}`);
+        this.logger.debug(`- Term1 (M2*Delta²): ${m2} * ${delta2} = ${term1}`);
+        this.logger.debug(`- Term2 (M1*Delta): ${m1} * ${this.delta} = ${term2}`);
+        this.logger.debug(`- Sum (Term1+Term2): ${term1} + ${term2} = ${sum}`);
+        this.logger.debug(`- Expected (Sum+M0): ${sum} + ${m0} = ${expected}`);
+      }
+      
+      return expected;
+    }
+  
     /**
      * @method verify
-     * @description Verify the combined values
+     * @description Verify the combined values with improved comparisons
      */
-    // Fixed verify method in AffineCorrelationVerifier class
     verify({ combinedK, combinedM2, combinedM1, combinedM0 }) {
-      this.logger.debug(`Verification inputs: 
-        delta=${this.delta}, 
-        combinedM2=${combinedM2}, 
-        combinedM1=${combinedM1}, 
-        combinedM0=${combinedM0}, 
-        combinedK=${combinedK}`);
+      // Calculate expected value from polynomial
+      const expected = this.calculateExpected({
+        combinedM2, 
+        combinedM1, 
+        combinedM0
+      });
       
-      // Calculate expected value carefully with modular arithmetic
-      const delta2 = this.field.multiply(this.delta, this.delta);
-      const term1 = this.field.multiply(combinedM2, delta2);
-      const term2 = this.field.multiply(combinedM1, this.delta);
-      const sum1 = this.field.add(term1, term2);
-      const expected = this.field.add(sum1, combinedM0);
+      // Ensure combinedK is properly validated
+      const validK = this.field.validateFieldElement(combinedK);
       
-      this.logger.debug(`Verification calculation:
-        delta²=${delta2}
-        term1=${term1} = ${combinedM2} × ${delta2}
-        term2=${term2} = ${combinedM1} × ${this.delta}
-        sum1=${sum1} = ${term1} + ${term2}
-        expected=${expected} = ${sum1} + ${combinedM0}`);
+      // Compare using field subtraction for robust comparison
+      const diff = this.field.subtract(validK, expected);
+      const isValid = diff === 0n;
       
-      // Compare using field operations to handle modular arithmetic
-      const isValid = combinedK === expected;
+      // Log verification result
+      if (this.logger && this.logger.debug) {
+        this.logger.debug(`Verification: K=${validK}, expected=${expected}, diff=${diff}`);
+        this.logger.debug(`Affine verification: ${isValid ? "PASS" : "FAIL"}`);
+      }
       
-      this.logger.debug(`Affine correlation verification: 
-        combinedK=${combinedK}, 
-        expected=${expected}, 
-        isValid=${isValid}`);
-      
-      return { isValid };
+      return { isValid, expected, actual: validK };
     }
-
-    
   }
+  
+  
 
   //============================================================================
   // LOGGER
@@ -1104,16 +1209,17 @@ combineValues({ M2, M1, M0, chi, r1, r2, mr1, mr2 }) {
 
       // Create circuits
       this.circuits = Array(this.B)
-        .fill()
-        .map((_, i) => {
-          return new Circuit({
-            id: i,
-            ninputs: this.ninputs,
-            nmuls: this.nmuls,
-            field: this.field,
-            satisfactionCondition: config.satisfactionConditions?.[i],
-          });
+      .fill()
+      .map((_, i) => {
+        return new Circuit({
+          id: i,
+          ninputs: this.ninputs,
+          nmuls: this.nmuls,
+          field: this.field,
+          satisfactionCondition: config.satisfactionConditions?.[i],
+          logger: this.logger // Pass the logger instance
         });
+      });
 
       // Initialize components
       this.verifierDelta = null; // Will be set during protocol execution
@@ -1166,42 +1272,42 @@ execute(proverInput) {
     // 1. Validate input
     this._validateProverInput(sanitizedInput);
     
-   
-    
     // 2. Initialize VOLE
     this.verifierDelta = this.vole.initialize();
     
     // 3. Generate correlations
     const correlations = this._generateCorrelations();
     
-    // 4. Evaluate active branch
-    const activeEval = this._evaluateActiveBranch(proverInput);
-    
-    // 5. Commit to witness
-    const commitments = this._commitToWitness(proverInput, correlations, activeEval);
-    
-    // 6. Evaluate multiplication triples
-    const batchedResult = this._evaluateMultiplicationTriples(commitments, proverInput);
-    
-    // 7. Evaluate all branches
-    const branchResults = this._evaluateAllBranches(proverInput, commitments);
-    
-    // 8. Zero-membership proof
-    const zeroResult = this._proveZeroMembership(branchResults, proverInput.id);
-    
-    // 9. Affine correlation proof
-    // In the execute method
-const affineResult = this._proveAffineCorrelation(branchResults, proverInput.id);
-    
-    // 10. Final verification
-    return this._finalVerification(batchedResult, zeroResult, affineResult);
-    
+    try {
+      // 4. Evaluate active branch
+      const activeEval = this._evaluateActiveBranch(sanitizedInput);
+      
+      // 5. Commit to witness
+      const commitments = this._commitToWitness(sanitizedInput, correlations, activeEval);
+      
+      // 6. Evaluate multiplication triples
+      const batchedResult = this._evaluateMultiplicationTriples(commitments, sanitizedInput);
+      
+      // 7. Evaluate all branches
+      const branchResults = this._evaluateAllBranches(sanitizedInput, commitments);
+      
+      // 8. Zero-membership proof
+      const zeroResult = this._proveZeroMembership(branchResults, sanitizedInput.id);
+      
+      // 9. Affine correlation proof
+      const affineResult = this._proveAffineCorrelation(branchResults, sanitizedInput.id);
+      
+      // 10. Final verification
+      return this._finalVerification(batchedResult, zeroResult, affineResult);
+    } catch (error) {
+      this.logger.error(`Protocol step execution failed: ${error.message}`);
+      return { success: false, error: error.message, step: error.step || "unknown" };
+    }
   } catch (error) {
-    this.logger.error("Protocol execution failed", error);
+    this.logger.error(`Protocol setup failed: ${error.message}`);
     return { success: false, error: error.message };
   }
 }
-
 
     /**
      * @method _validateProverInput
@@ -1260,23 +1366,37 @@ const affineResult = this._proveAffineCorrelation(branchResults, proverInput.id)
      * @description Evaluate the active branch with prover's witness
      */
     _evaluateActiveBranch(proverInput) {
-      this.logger.debug(`Evaluating active branch ${proverInput.id}`);
-
-      const activeBranch = this.circuits[proverInput.id];
-      const evaluation = activeBranch.evaluate({
-        inputs: proverInput.witness,
-      });
-
-      if (!evaluation.satisfied) {
-        throw new Error(`Witness does not satisfy circuit ${proverInput.id}`);
+      try {
+        this.logger.debug(`Evaluating active branch ${proverInput.id}`);
+    
+        if (proverInput.id < 0 || proverInput.id >= this.B) {
+          throw new Error(`Invalid branch ID: ${proverInput.id}`);
+        }
+    
+        const activeBranch = this.circuits[proverInput.id];
+        if (!activeBranch) {
+          throw new Error(`Circuit for branch ${proverInput.id} not found`);
+        }
+    
+        const inputs = proverInput.witness.map(w => BigInt(w));
+        const evaluation = activeBranch.evaluate({
+          inputs
+        });
+    
+        if (!evaluation.satisfied) {
+          throw new Error(`Witness does not satisfy circuit ${proverInput.id}`);
+        }
+    
+        this.logger.debug("Active branch evaluation succeeded", {
+          id: proverInput.id,
+          mulOutputs: evaluation.mulOutputs.map((x) => x.toString()),
+        });
+    
+        return evaluation;
+      } catch (error) {
+        this.logger.error(`Error evaluating active branch: ${error.message}`);
+        throw error;
       }
-
-      this.logger.debug("Active branch evaluation succeeded", {
-        id: proverInput.id,
-        mulOutputs: evaluation.mulOutputs.map((x) => x.toString()),
-      });
-
-      return evaluation;
     }
 
     /**
@@ -1511,8 +1631,18 @@ const affineResult = this._proveAffineCorrelation(branchResults, proverInput.id)
      * @description Prove zero-membership using LogRobin technique
      */
 // Fixed version of _proveZeroMembership method
+// Validation for _proveZeroMembership in LogRobinPlusPlus class
 _proveZeroMembership(branchResults, activeId) {
   this.logger.debug("Running zero-membership subprotocol");
+
+  // Validate inputs
+  if (!branchResults || !branchResults.M2 || !Array.isArray(branchResults.M2)) {
+    throw new Error("Invalid branch results structure");
+  }
+  
+  if (activeId < 0 || activeId >= this.B) {
+    throw new Error(`Active ID ${activeId} is out of bounds [0,${this.B-1}]`);
+  }
 
   // Initialize components
   const zeroProver = new ZeroMembershipProver({
@@ -1527,11 +1657,11 @@ _proveZeroMembership(branchResults, activeId) {
     B: this.B,
   });
 
-  // Decompose active branch ID into bits
+  // Decompose active branch ID into bits and validate
   const idBits = zeroProver.decomposeId(activeId);
   this.logger.debug("ID bits", idBits);
 
-  // Generate Lambda challenge - ensure it's non-zero
+  // Generate Lambda challenge with validation for non-zero
   let Lambda;
   do {
     Lambda = zeroVerifier.generateLambda();
@@ -1544,42 +1674,55 @@ _proveZeroMembership(branchResults, activeId) {
     .fill()
     .map(() => this.field.randomElement());
 
-  // Construct path matrix - ensure proper construction
+  // Construct path matrix with validation
   const pathMatrix = zeroProver.constructPathMatrix({
     idBits,
     Lambda,
     deltaValues,
   });
 
+  // Validate the constructed matrix
+  if (!pathMatrix || pathMatrix.length !== 2 || !pathMatrix[0] || pathMatrix[0].length !== this.b) {
+    throw new Error("Invalid path matrix structure after construction");
+  }
+
   // Log matrix for debugging
   this.logger.debug("Path matrix:", 
-    JSON.stringify(pathMatrix.map(row => row.map(v => v.toString()))));
+    pathMatrix.map(row => row.map(v => v.toString())));
 
-  // Compute branch coefficients
+  // Compute branch coefficients with validation
   const branchCoefficients = zeroProver.computeBranchCoefficients({
     pathMatrix,
   });
   
-  // Ensure M2 values are valid
+  if (!branchCoefficients || branchCoefficients.length !== this.B) {
+    throw new Error(`Invalid branch coefficients length: expected ${this.B}`);
+  }
+  
+  // Ensure M2 values are valid field elements
   const M2Values = branchResults.M2.map(val => 
     // Ensure all values are proper field elements
-    this.field.add(val, 0n)
+    this.field.validateFieldElement(val)
   );
 
-  // Prepare polynomial coefficients with extra validation
+  // Prepare polynomial coefficients with validation
   const polynomialCoefficients = zeroProver.preparePolynomialCoefficients({
     values: M2Values,
     branchCoefficients,
     id: activeId,
   });
 
-  // Compute S value
+  if (!polynomialCoefficients || polynomialCoefficients.length !== this.b) {
+    throw new Error(`Invalid polynomial coefficients length: expected ${this.b}`);
+  }
+
+  // Compute S value with validation
   const S = zeroVerifier.computeS({
     branchCoefficients,
     values: M2Values,
   });
 
-  // Evaluate polynomial at Lambda
+  // Evaluate polynomial at Lambda with validation
   const polynomialValue = zeroVerifier.evaluatePolynomial({
     coefficients: polynomialCoefficients,
     Lambda,
@@ -1630,12 +1773,6 @@ _proveZeroMembership(branchResults, activeId) {
 _proveAffineCorrelation(branchResults, activeId) {
   this.logger.debug("Running affine correlation subprotocol");
   
-  // Log the entire branchResults
-  this.logger.debug(`branchResults.M2: ${branchResults.M2.map(v => v.toString())}`);
-  this.logger.debug(`branchResults.M1: ${branchResults.M1.map(v => v.toString())}`);
-  this.logger.debug(`branchResults.M0: ${branchResults.M0.map(v => v.toString())}`);
-  this.logger.debug(`branchResults.K: ${branchResults.K.map(v => v.toString())}`);
-  
   // Initialize components
   const affineProver = new AffineCorrelationProver({
     field: this.field,
@@ -1650,73 +1787,38 @@ _proveAffineCorrelation(branchResults, activeId) {
     delta: this.verifierDelta,
   });
 
-  // Generate chi challenges with a fixed seed for debugging
+  // Generate chi challenges 
   const chi = affineVerifier.generateChi();
   this.logger.debug(`Generated chi challenges: ${chi.map(c => c.toString())}`);
 
-  // Generate random masking values
-  const r1 = this.field.randomElement();
-  const r2 = this.field.randomElement();
-  const mr1 = this.field.randomElement();
-  const mr2 = this.field.randomElement();
+  // Generate and validate random masking values
+  const r1 = this.field.validateFieldElement(this.field.randomElement());
+  const r2 = this.field.validateFieldElement(this.field.randomElement());
+  const mr1 = this.field.validateFieldElement(this.field.randomElement());
+  const mr2 = this.field.validateFieldElement(this.field.randomElement());
   this.logger.debug(`Random masking values: r1=${r1}, r2=${r2}, mr1=${mr1}, mr2=${mr2}`);
 
-  // Keys for masking - CRITICAL: Ensure these are computed consistently
-  // First, get proper field elements
-  const fieldR1 = this.field.add(r1, 0n);
-  const fieldR2 = this.field.add(r2, 0n);
-  const fieldMR1 = this.field.add(mr1, 0n);
-  const fieldMR2 = this.field.add(mr2, 0n);
-
-  // Now calculate key masking values
+  // Calculate masking keys with consistent field operations
   const kr1 = this.field.add(
-    this.field.multiply(fieldR1, this.verifierDelta),
-    fieldMR1
+    this.field.multiply(r1, this.verifierDelta),
+    mr1
   );
-  const kr2 = this.field.multiply(fieldR2, this.verifierDelta);
+  const kr2 = this.field.multiply(r2, this.verifierDelta);
   this.logger.debug(`Key masking values: kr1=${kr1}, kr2=${kr2}`);
 
-  // Combine values with masking - prover side
-  const { combinedM1, combinedM0, combinedM2 } = affineProver.combineValues({
+  // Combine values - prover side
+  const { combinedM2, combinedM1, combinedM0 } = affineProver.combineValues({
     M2: branchResults.M2,
     M1: branchResults.M1,
     M0: branchResults.M0,
     chi,
-    r1: fieldR1,
-    r2: fieldR2,
-    mr1: fieldMR1,
-    mr2: fieldMR2,
+    r1,
+    r2,
+    mr1,
+    mr2,
   });
 
-  // Manually calculate combinedK for debugging and comparison
-  let manualK = this.field.add(kr1, kr2);
-  this.logger.debug(`Manual combinedK starting with kr1+kr2=${manualK}`);
-  
-  for (let i = 0; i < this.B; i++) {
-    const chiVal = this.field.add(chi[i], 0n);
-    const kVal = this.field.add(branchResults.K[i], 0n);
-    
-    const contribution = this.field.multiply(chiVal, kVal);
-    this.logger.debug(`Branch ${i} contribution: ${chiVal} * ${kVal} = ${contribution}`);
-    
-    manualK = this.field.add(manualK, contribution);
-    this.logger.debug(`manualK after branch ${i}: ${manualK}`);
-  }
-  
-  this.logger.debug(`Final manual combinedK: ${manualK}`);
-
-  // Calculate expected polynomial value with proper field operations
-  const delta2 = this.field.multiply(this.verifierDelta, this.verifierDelta);
-  
-  // Use field operations for all calculations to ensure modular arithmetic is correct
-  const term1 = this.field.multiply(combinedM2, delta2);
-  const term2 = this.field.multiply(combinedM1, this.verifierDelta);
-  const sum1 = this.field.add(term1, term2);
-  const expectedPolyValue = this.field.add(sum1, combinedM0);
-  
-  this.logger.debug(`Expected polynomial value from coefficients: ${expectedPolyValue}`);
-  
-  // Now have the verifier combine K values
+  // Combine K values - verifier side
   const combinedK = affineVerifier.combineK({
     K: branchResults.K,
     chi,
@@ -1724,32 +1826,48 @@ _proveAffineCorrelation(branchResults, activeId) {
     kr2,
   });
   
-  this.logger.debug(`Verifier combinedK: ${combinedK}`);
-
-  // If there's a discrepancy, use the manually calculated K for debugging
-  if (combinedK !== manualK) {
-    this.logger.debug(`WARNING: combinedK (${combinedK}) ≠ manualK (${manualK})`);
-  }
-
-  // Verify using properly calculated values
+  // Calculate expected value for verification
+  const expected = affineVerifier.calculateExpected({
+    combinedM2,
+    combinedM1,
+    combinedM0
+  });
+  
+  this.logger.debug(`Expected polynomial value: ${expected}`);
+  this.logger.debug(`Actual combinedK value: ${combinedK}`);
+  
+  // Perform verification
   const verificationResult = affineVerifier.verify({
-    combinedK: manualK, // Use manual calculation as a fallback
+    combinedK,
     combinedM2,
     combinedM1,
     combinedM0,
   });
 
-  this.logger.debug(`Affine correlation verification result: ${verificationResult.isValid ? 'PASS' : 'FAIL'}`);
+  // Log detailed result
+  if (!verificationResult.isValid) {
+    this.logger.debug(`VERIFICATION FAILED: expected=${verificationResult.expected}, actual=${verificationResult.actual}`);
+    this.logger.debug(`Difference: ${this.field.subtract(verificationResult.expected, verificationResult.actual)}`);
+  } else {
+    this.logger.debug(`Affine correlation verification PASSED`);
+  }
 
   return {
     isValid: verificationResult.isValid,
-    combinedK: manualK,
+    combinedK,
     combinedM2,
     combinedM1,
     combinedM0,
+    expected: verificationResult.expected
   };
 }
 
+// Export the fixed implementation
+// module.exports = {
+//   AffineCorrelationProver,
+//   AffineCorrelationVerifier,
+//   _proveAffineCorrelation
+// };
     /**
      * @method _finalVerification
      * @description Combine all verification results for final decision
